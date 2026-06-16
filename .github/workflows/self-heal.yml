@@ -1,0 +1,290 @@
+# =============================================================================
+# SELF-HEALING CI/CD - AI-Powered Failure Analysis
+# =============================================================================
+# This workflow triggers AUTOMATICALLY when the CI Pipeline fails.
+# It uses GitHub Models (free tier) to:
+#   1. Fetch the failure logs from GitHub Actions API
+#   2. Send them to an AI model for root cause analysis
+#   3. Create a GitHub Issue with the diagnosis + suggested fix
+#   4. (Optional) Attempt an auto-fix PR for known failure patterns
+#
+# COST: $0 — Uses GitHub Models free tier + built-in GITHUB_TOKEN
+# =============================================================================
+
+name: "Self-Heal: AI Failure Analysis"
+
+on:
+  workflow_run:
+    workflows: ["CI Pipeline"]
+    types:
+      - completed
+
+permissions:
+  contents: read
+  issues: write
+  actions: read
+  models: read
+
+jobs:
+  analyze-failure:
+    # Only run when CI Pipeline has FAILED
+    if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------
+      # STEP 1: Fetch failure logs from the failed workflow run
+      # ---------------------------------------------------------------
+      - name: Fetch failure logs
+        id: fetch-logs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "::group::Fetching failed jobs for run $RUN_ID"
+
+          # Get all jobs from the failed run
+          JOBS_JSON=$(gh api "/repos/$REPO/actions/runs/$RUN_ID/jobs" \
+            --jq '.jobs[] | select(.conclusion == "failure")')
+
+          if [ -z "$JOBS_JSON" ]; then
+            echo "No failed jobs found. Exiting."
+            echo "has_failures=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "has_failures=true" >> "$GITHUB_OUTPUT"
+          echo "::endgroup::"
+
+          # Extract failed job details
+          FAILED_JOBS=$(gh api "/repos/$REPO/actions/runs/$RUN_ID/jobs" \
+            --jq '[.jobs[] | select(.conclusion == "failure") | {
+              id: .id,
+              name: .name,
+              failed_step: (.steps[] | select(.conclusion == "failure") | .name)
+            }]')
+
+          echo "Failed jobs: $FAILED_JOBS"
+          echo "failed_jobs=$FAILED_JOBS" >> "$GITHUB_OUTPUT"
+
+          # Download full logs (truncate to last 200 lines per job to stay within token limits)
+          FULL_LOGS=""
+          for JOB_ID in $(echo "$FAILED_JOBS" | jq -r '.[].id'); do
+            echo "::group::Fetching logs for job $JOB_ID"
+            JOB_LOG=$(gh api "/repos/$REPO/actions/jobs/$JOB_ID/logs" 2>/dev/null | tail -200)
+            FULL_LOGS="${FULL_LOGS}\n\n=== JOB ${JOB_ID} LOGS ===\n${JOB_LOG}"
+            echo "::endgroup::"
+          done
+
+          # Save logs to file (avoid shell escaping issues)
+          echo -e "$FULL_LOGS" > /tmp/failure_logs.txt
+
+          # Also capture the commit info
+          COMMIT_SHA="${{ github.event.workflow_run.head_sha }}"
+          COMMIT_MSG=$(gh api "/repos/$REPO/commits/$COMMIT_SHA" --jq '.commit.message' 2>/dev/null || echo "N/A")
+          BRANCH="${{ github.event.workflow_run.head_branch }}"
+
+          echo "commit_sha=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
+          echo "commit_msg=$COMMIT_MSG" >> "$GITHUB_OUTPUT"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      # ---------------------------------------------------------------
+      # STEP 2: Send logs to GitHub Models AI for analysis
+      # ---------------------------------------------------------------
+      - name: AI-powered root cause analysis
+        if: steps.fetch-logs.outputs.has_failures == 'true'
+        id: ai-analysis
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Read the failure logs
+          LOGS=$(cat /tmp/failure_logs.txt | head -c 12000)
+
+          FAILED_JOBS='${{ steps.fetch-logs.outputs.failed_jobs }}'
+          COMMIT_MSG='${{ steps.fetch-logs.outputs.commit_msg }}'
+          BRANCH='${{ steps.fetch-logs.outputs.branch }}'
+
+          # Build the AI prompt
+          SYSTEM_PROMPT="You are an expert CI/CD engineer and debugging assistant. \
+          You analyze GitHub Actions failure logs and provide clear, actionable root cause analysis. \
+          Be concise and specific. Focus on the actual error, not boilerplate log noise."
+
+          USER_PROMPT="A CI pipeline has failed. Analyze the following and provide:\n\n\
+          1. **Root Cause**: What exactly failed and why (1-2 sentences)\n\
+          2. **Error Category**: One of [dependency_issue, test_failure, lint_error, build_error, config_error, timeout, infra_flake]\n\
+          3. **Suggested Fix**: Specific code or config changes to resolve the issue\n\
+          4. **Auto-fixable**: yes or no — can this be fixed programmatically without human judgment?\n\
+          5. **Severity**: low / medium / high / critical\n\n\
+          ---\n\
+          **Branch**: ${BRANCH}\n\
+          **Commit Message**: ${COMMIT_MSG}\n\
+          **Failed Jobs**: ${FAILED_JOBS}\n\n\
+          **Failure Logs**:\n\`\`\`\n${LOGS}\n\`\`\`"
+
+          # Call GitHub Models API (FREE — uses built-in GITHUB_TOKEN)
+          RESPONSE=$(curl -s -X POST \
+            "https://models.github.ai/inference/chat/completions" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -d "$(jq -n \
+              --arg system "$SYSTEM_PROMPT" \
+              --arg user "$USER_PROMPT" \
+              '{
+                "model": "openai/gpt-4o-mini",
+                "messages": [
+                  {"role": "system", "content": $system},
+                  {"role": "user", "content": $user}
+                ],
+                "temperature": 0.3,
+                "max_tokens": 1500
+              }')")
+
+          # Extract the AI response
+          AI_ANALYSIS=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // "AI analysis failed — see raw response below.\n\n" + (. | tostring)')
+
+          echo "AI Analysis complete."
+
+          # Save to file to avoid escaping issues in GITHUB_OUTPUT
+          echo "$AI_ANALYSIS" > /tmp/ai_analysis.txt
+
+          # Try to extract the error category for labeling
+          CATEGORY=$(echo "$AI_ANALYSIS" | grep -oP '(?<=\*\*Error Category\*\*:\s)(.*?)(?=\n|$)' | head -1 | tr -d '`' | xargs)
+          echo "category=${CATEGORY:-unknown}" >> "$GITHUB_OUTPUT"
+
+          SEVERITY=$(echo "$AI_ANALYSIS" | grep -oiP '(?<=\*\*Severity\*\*:\s)(low|medium|high|critical)' | head -1)
+          echo "severity=${SEVERITY:-medium}" >> "$GITHUB_OUTPUT"
+
+          AUTO_FIXABLE=$(echo "$AI_ANALYSIS" | grep -oiP '(?<=\*\*Auto-fixable\*\*:\s)(yes|no)' | head -1)
+          echo "auto_fixable=${AUTO_FIXABLE:-no}" >> "$GITHUB_OUTPUT"
+
+      # ---------------------------------------------------------------
+      # STEP 3: Create a GitHub Issue with the AI diagnosis
+      # ---------------------------------------------------------------
+      - name: Create diagnostic issue
+        if: steps.fetch-logs.outputs.has_failures == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          REPO: ${{ github.repository }}
+        run: |
+          AI_ANALYSIS=$(cat /tmp/ai_analysis.txt)
+          CATEGORY="${{ steps.ai-analysis.outputs.category }}"
+          SEVERITY="${{ steps.ai-analysis.outputs.severity }}"
+          BRANCH="${{ steps.fetch-logs.outputs.branch }}"
+          COMMIT_SHA="${{ steps.fetch-logs.outputs.commit_sha }}"
+          COMMIT_MSG="${{ steps.fetch-logs.outputs.commit_msg }}"
+          RUN_URL="https://github.com/$REPO/actions/runs/$RUN_ID"
+
+          # Build the issue body
+          ISSUE_BODY="## 🤖 AI-Powered CI Failure Analysis
+
+          > **Auto-generated by the Self-Healing CI/CD pipeline**
+
+          | Detail | Value |
+          |--------|-------|
+          | **Branch** | \`$BRANCH\` |
+          | **Commit** | [\`${COMMIT_SHA:0:7}\`](https://github.com/$REPO/commit/$COMMIT_SHA) |
+          | **Commit Message** | $COMMIT_MSG |
+          | **Failed Run** | [View Logs]($RUN_URL) |
+          | **Severity** | $SEVERITY |
+          | **Category** | $CATEGORY |
+
+          ---
+
+          ## 🔍 Root Cause Analysis
+
+          $AI_ANALYSIS
+
+          ---
+
+          <sub>🧠 Analyzed by GitHub Models (GPT-4o-mini) • Free Tier • Zero cost</sub>
+          <sub>📋 Workflow: Self-Heal AI Failure Analysis</sub>"
+
+          # Determine labels
+          LABELS="ai-diagnosis,ci-failure"
+          case "$SEVERITY" in
+            critical) LABELS="$LABELS,priority:critical" ;;
+            high)     LABELS="$LABELS,priority:high" ;;
+            medium)   LABELS="$LABELS,priority:medium" ;;
+            low)      LABELS="$LABELS,priority:low" ;;
+          esac
+
+          # Create the issue
+          gh issue create \
+            --title "🤖 CI Failure: [$CATEGORY] on \`$BRANCH\` — ${COMMIT_SHA:0:7}" \
+            --body "$ISSUE_BODY" \
+            --label "$LABELS" 2>/dev/null || \
+          gh issue create \
+            --title "🤖 CI Failure: [$CATEGORY] on \`$BRANCH\` — ${COMMIT_SHA:0:7}" \
+            --body "$ISSUE_BODY"
+
+          echo "✅ Diagnostic issue created successfully."
+
+      # ---------------------------------------------------------------
+      # STEP 4 (Stretch): Attempt auto-fix for simple categories
+      # ---------------------------------------------------------------
+      - name: Attempt auto-fix (if applicable)
+        if: |
+          steps.fetch-logs.outputs.has_failures == 'true' &&
+          steps.ai-analysis.outputs.auto_fixable == 'yes'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CATEGORY="${{ steps.ai-analysis.outputs.category }}"
+          BRANCH="${{ steps.fetch-logs.outputs.branch }}"
+          FIX_BRANCH="auto-fix/${BRANCH}-$(date +%s)"
+
+          echo "🔧 Attempting auto-fix for category: $CATEGORY"
+
+          case "$CATEGORY" in
+            dependency_issue)
+              echo "Attempting to fix dependency issues..."
+              git checkout -b "$FIX_BRANCH"
+
+              # Delete lockfile and regenerate
+              rm -f package-lock.json
+              npm install
+
+              git add package-lock.json package.json
+              git commit -m "fix(deps): auto-fix dependency issues [self-healing-ci]"
+              git push origin "$FIX_BRANCH"
+
+              gh pr create \
+                --title "🤖 Auto-fix: Dependency resolution for \`$BRANCH\`" \
+                --body "Automated fix generated by the Self-Healing CI pipeline.\n\n**Category**: $CATEGORY\n**Action taken**: Regenerated package-lock.json\n\n> ⚠️ Please review before merging." \
+                --base "$BRANCH" \
+                --head "$FIX_BRANCH"
+              ;;
+
+            lint_error)
+              echo "Attempting to auto-fix lint errors..."
+              git checkout -b "$FIX_BRANCH"
+
+              npx eslint src/ __tests__/ --fix || true
+
+              if git diff --quiet; then
+                echo "No auto-fixable lint errors found."
+                exit 0
+              fi
+
+              git add -A
+              git commit -m "fix(lint): auto-fix lint errors [self-healing-ci]"
+              git push origin "$FIX_BRANCH"
+
+              gh pr create \
+                --title "🤖 Auto-fix: Lint errors on \`$BRANCH\`" \
+                --body "Automated fix generated by the Self-Healing CI pipeline.\n\n**Category**: $CATEGORY\n**Action taken**: Ran \`eslint --fix\`\n\n> ⚠️ Please review before merging." \
+                --base "$BRANCH" \
+                --head "$FIX_BRANCH"
+              ;;
+
+            *)
+              echo "Category '$CATEGORY' does not have an auto-fix strategy yet."
+              echo "Creating issue only — human intervention needed."
+              ;;
+          esac
