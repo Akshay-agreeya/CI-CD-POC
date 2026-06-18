@@ -39,4 +39,4 @@ function fibonacci(n) {
 }
 
 module.exports = { add, subtract, multiply, divide, factorial, fibonacci };
-const greeting = 'this should be double quotes'
+const testValue = 'fresh lint error for demo'
