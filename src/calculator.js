@@ -39,4 +39,4 @@ function fibonacci(n) {
 }
 
 module.exports = { add, subtract, multiply, divide, factorial, fibonacci };
-const testValue = 'fresh lint error for demo'
+const testValue = "fresh lint error for demo";
