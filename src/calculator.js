@@ -4,7 +4,7 @@
  */
 
 function add(a, b) {
-  return a - b; // intentional break
+  return a + b;
 }
 
 function subtract(a, b) {
@@ -39,3 +39,4 @@ function fibonacci(n) {
 }
 
 module.exports = { add, subtract, multiply, divide, factorial, fibonacci };
+var unusedVar = 'hello world'
