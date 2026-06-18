@@ -1,16 +1,3 @@
-# =============================================================================
-# SELF-HEALING CI/CD - AI-Powered Failure Analysis
-# =============================================================================
-# This workflow triggers AUTOMATICALLY when the CI Pipeline fails.
-# It uses GitHub Models (free tier) to:
-#   1. Fetch the failure logs from GitHub Actions API
-#   2. Send them to an AI model for root cause analysis
-#   3. Create a GitHub Issue with the diagnosis + suggested fix
-#   4. Auto-fix PR for lint errors (fully automated end-to-end)
-#
-# COST: $0 — Uses GitHub Models free tier + built-in GITHUB_TOKEN
-# =============================================================================
-
 name: "Self-Heal: AI Failure Analysis"
 
 on:
@@ -20,9 +7,9 @@ on:
       - completed
 
 permissions:
-  contents: write          # push auto-fix branch
-  issues: write            # create diagnostic issues
-  pull-requests: write     # open auto-fix PRs
+  contents: write
+  issues: write
+  pull-requests: write
   actions: read
   models: read
 
@@ -35,12 +22,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # full history needed for branching in auto-fix
+          fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      # ---------------------------------------------------------------
-      # STEP 1: Fetch failure logs from the failed workflow run
-      # ---------------------------------------------------------------
       - name: Fetch failure logs
         id: fetch-logs
         env:
@@ -48,39 +32,23 @@ jobs:
           RUN_ID: ${{ github.event.workflow_run.id }}
           REPO: ${{ github.repository }}
         run: |
-          echo "::group::Fetching failed jobs for run $RUN_ID"
-
-          JOBS_JSON=$(gh api "/repos/$REPO/actions/runs/$RUN_ID/jobs" \
-            --jq '.jobs[] | select(.conclusion == "failure")')
+          JOBS_JSON=$(gh api "/repos/$REPO/actions/runs/$RUN_ID/jobs" --jq '.jobs[] | select(.conclusion == "failure")')
 
           if [ -z "$JOBS_JSON" ]; then
-            echo "No failed jobs found. Exiting."
             echo "has_failures=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           echo "has_failures=true" >> "$GITHUB_OUTPUT"
-          echo "::endgroup::"
 
-          FAILED_JOBS=$(gh api "/repos/$REPO/actions/runs/$RUN_ID/jobs" \
-            --jq '[.jobs[] | select(.conclusion == "failure") | {
-              id: .id,
-              name: .name,
-              failed_step: (.steps[] | select(.conclusion == "failure") | .name)
-            }]')
-
-          echo "Failed jobs: $FAILED_JOBS"
+          FAILED_JOBS=$(gh api "/repos/$REPO/actions/runs/$RUN_ID/jobs" --jq '[.jobs[] | select(.conclusion == "failure") | {id: .id, name: .name}]')
           echo "failed_jobs=$FAILED_JOBS" >> "$GITHUB_OUTPUT"
 
-          FULL_LOGS=""
+          rm -f /tmp/failure_logs.txt
           for JOB_ID in $(echo "$FAILED_JOBS" | jq -r '.[].id'); do
-            echo "::group::Fetching logs for job $JOB_ID"
-            JOB_LOG=$(gh api "/repos/$REPO/actions/jobs/$JOB_ID/logs" 2>/dev/null | tail -200)
-            FULL_LOGS="${FULL_LOGS}\n\n=== JOB ${JOB_ID} LOGS ===\n${JOB_LOG}"
-            echo "::endgroup::"
+            echo "=== JOB $JOB_ID LOGS ===" >> /tmp/failure_logs.txt
+            gh api "/repos/$REPO/actions/jobs/$JOB_ID/logs" 2>/dev/null | tail -200 >> /tmp/failure_logs.txt
           done
-
-          echo -e "$FULL_LOGS" > /tmp/failure_logs.txt
 
           COMMIT_SHA="${{ github.event.workflow_run.head_sha }}"
           COMMIT_MSG=$(gh api "/repos/$REPO/commits/$COMMIT_SHA" --jq '.commit.message' 2>/dev/null || echo "N/A")
@@ -90,57 +58,47 @@ jobs:
           echo "commit_msg=$COMMIT_MSG" >> "$GITHUB_OUTPUT"
           echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
 
-      # ---------------------------------------------------------------
-      # STEP 2: AI root cause analysis via GitHub Models (free)
-      # ---------------------------------------------------------------
       - name: AI-powered root cause analysis
         if: steps.fetch-logs.outputs.has_failures == 'true'
         id: ai-analysis
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FAILED_JOBS: ${{ steps.fetch-logs.outputs.failed_jobs }}
+          COMMIT_MSG: ${{ steps.fetch-logs.outputs.commit_msg }}
+          BRANCH: ${{ steps.fetch-logs.outputs.branch }}
         run: |
-          LOGS=$(cat /tmp/failure_logs.txt | head -c 12000)
-          FAILED_JOBS='${{ steps.fetch-logs.outputs.failed_jobs }}'
-          COMMIT_MSG='${{ steps.fetch-logs.outputs.commit_msg }}'
-          BRANCH='${{ steps.fetch-logs.outputs.branch }}'
+          LOGS=$(head -c 12000 /tmp/failure_logs.txt)
 
-          SYSTEM_PROMPT="You are an expert CI/CD engineer and debugging assistant. \
-          You analyze GitHub Actions failure logs and provide clear, actionable root cause analysis. \
-          Be concise and specific. Focus on the actual error, not boilerplate log noise."
+          SYSTEM_PROMPT='You are an expert CI/CD engineer and debugging assistant. You analyze GitHub Actions failure logs and provide clear, actionable root cause analysis. Be concise and specific.'
 
-          USER_PROMPT="A CI pipeline has failed. Analyze the following and provide:\n\n\
-          1. **Root Cause**: What exactly failed and why (1-2 sentences)\n\
-          2. **Error Category**: One of [dependency_issue, test_failure, lint_error, build_error, config_error, timeout, infra_flake]\n\
-          3. **Suggested Fix**: Specific code or config changes to resolve the issue\n\
-          4. **Auto-fixable**: yes or no — can this be fixed programmatically without human judgment?\n\
-          5. **Severity**: low / medium / high / critical\n\n\
-          ---\n\
-          **Branch**: ${BRANCH}\n\
-          **Commit Message**: ${COMMIT_MSG}\n\
-          **Failed Jobs**: ${FAILED_JOBS}\n\n\
-          **Failure Logs**:\n\`\`\`\n${LOGS}\n\`\`\`"
+          {
+            echo "A CI pipeline has failed. Analyze the following and provide:"
+            echo ""
+            echo "1. **Root Cause**: What exactly failed and why (1-2 sentences)"
+            echo "2. **Error Category**: One of [dependency_issue, test_failure, lint_error, build_error, config_error, timeout, infra_flake]"
+            echo "3. **Suggested Fix**: Specific code or config changes to resolve the issue"
+            echo "4. **Auto-fixable**: yes or no"
+            echo "5. **Severity**: low / medium / high / critical"
+            echo ""
+            echo "Branch: $BRANCH"
+            echo "Commit Message: $COMMIT_MSG"
+            echo "Failed Jobs: $FAILED_JOBS"
+            echo ""
+            echo "Failure Logs:"
+            echo "$LOGS"
+          } > /tmp/user_prompt.txt
+          USER_PROMPT=$(cat /tmp/user_prompt.txt)
 
-          RESPONSE=$(curl -s -X POST \
-            "https://models.github.ai/inference/chat/completions" \
-            -H "Content-Type: application/json" \
-            -H "Authorization: Bearer $GITHUB_TOKEN" \
-            -d "$(jq -n \
-              --arg system "$SYSTEM_PROMPT" \
-              --arg user "$USER_PROMPT" \
-              '{
-                "model": "openai/gpt-4o-mini",
-                "messages": [
-                  {"role": "system", "content": $system},
-                  {"role": "user", "content": $user}
-                ],
-                "temperature": 0.3,
-                "max_tokens": 1500
-              }')")
+          RESPONSE=$(jq -n --arg system "$SYSTEM_PROMPT" --arg user "$USER_PROMPT" '{model: "openai/gpt-4o-mini", messages: [{role: "system", content: $system}, {role: "user", content: $user}], temperature: 0.3, max_tokens: 1500}' | \
+            curl -s -X POST "https://models.github.ai/inference/chat/completions" \
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -d @-)
 
-          AI_ANALYSIS=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // "AI analysis failed.\n\n" + (. | tostring)')
-          echo "$AI_ANALYSIS" > /tmp/ai_analysis.txt
+          AI_ANALYSIS=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // "AI analysis failed."')
+          printf '%s\n' "$AI_ANALYSIS" > /tmp/ai_analysis.txt
 
-          CATEGORY=$(echo "$AI_ANALYSIS" | grep -oP '(?<=\*\*Error Category\*\*:\s)(.*?)(?=\n|$)' | head -1 | tr -d '`' | xargs)
+          CATEGORY=$(echo "$AI_ANALYSIS" | grep -oP '(?<=\*\*Error Category\*\*:\s)([a-z_]+)' | head -1)
           echo "category=${CATEGORY:-unknown}" >> "$GITHUB_OUTPUT"
 
           SEVERITY=$(echo "$AI_ANALYSIS" | grep -oiP '(?<=\*\*Severity\*\*:\s)(low|medium|high|critical)' | head -1)
@@ -149,60 +107,49 @@ jobs:
           AUTO_FIXABLE=$(echo "$AI_ANALYSIS" | grep -oiP '(?<=\*\*Auto-fixable\*\*:\s)(yes|no)' | head -1)
           echo "auto_fixable=${AUTO_FIXABLE:-no}" >> "$GITHUB_OUTPUT"
 
-          echo "✅ AI analysis complete. Category: ${CATEGORY}, Auto-fixable: ${AUTO_FIXABLE}"
+          echo "Category: ${CATEGORY}, Auto-fixable: ${AUTO_FIXABLE}"
 
-      # ---------------------------------------------------------------
-      # STEP 3: Create a GitHub Issue with the AI diagnosis
-      # ---------------------------------------------------------------
       - name: Create diagnostic issue
         if: steps.fetch-logs.outputs.has_failures == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_ID: ${{ github.event.workflow_run.id }}
           REPO: ${{ github.repository }}
+          CATEGORY: ${{ steps.ai-analysis.outputs.category }}
+          SEVERITY: ${{ steps.ai-analysis.outputs.severity }}
+          AUTO_FIXABLE: ${{ steps.ai-analysis.outputs.auto_fixable }}
+          BRANCH: ${{ steps.fetch-logs.outputs.branch }}
+          COMMIT_SHA: ${{ steps.fetch-logs.outputs.commit_sha }}
+          COMMIT_MSG: ${{ steps.fetch-logs.outputs.commit_msg }}
         run: |
           AI_ANALYSIS=$(cat /tmp/ai_analysis.txt)
-          CATEGORY="${{ steps.ai-analysis.outputs.category }}"
-          SEVERITY="${{ steps.ai-analysis.outputs.severity }}"
-          AUTO_FIXABLE="${{ steps.ai-analysis.outputs.auto_fixable }}"
-          BRANCH="${{ steps.fetch-logs.outputs.branch }}"
-          COMMIT_SHA="${{ steps.fetch-logs.outputs.commit_sha }}"
-          COMMIT_MSG="${{ steps.fetch-logs.outputs.commit_msg }}"
           RUN_URL="https://github.com/$REPO/actions/runs/$RUN_ID"
+          SHORT_SHA="${COMMIT_SHA:0:7}"
 
-          # Show auto-fix status in issue
-          if [ "$AUTO_FIXABLE" = "yes" ]; then
-            FIX_STATUS="🔧 **Auto-fix PR will be opened automatically**"
-          else
-            FIX_STATUS="👤 **Requires manual fix** — see suggested fix below"
-          fi
-
-          ISSUE_BODY="## 🤖 AI-Powered CI Failure Analysis
-
-> **Auto-generated by the Self-Healing CI/CD pipeline**
-
-| Detail | Value |
-|--------|-------|
-| **Branch** | \`$BRANCH\` |
-| **Commit** | [\`${COMMIT_SHA:0:7}\`](https://github.com/$REPO/commit/$COMMIT_SHA) |
-| **Commit Message** | $COMMIT_MSG |
-| **Failed Run** | [View Logs]($RUN_URL) |
-| **Severity** | $SEVERITY |
-| **Category** | $CATEGORY |
-| **Auto-fix** | $AUTO_FIXABLE |
-
-$FIX_STATUS
-
----
-
-## 🔍 Root Cause Analysis
-
-$AI_ANALYSIS
-
----
-
-<sub>🧠 Analyzed by GitHub Models (GPT-4o-mini) • Free Tier • Zero cost</sub>
-<sub>📋 Workflow: Self-Heal AI Failure Analysis</sub>"
+          {
+            echo "## AI-Powered CI Failure Analysis"
+            echo ""
+            echo "Auto-generated by the Self-Healing CI/CD pipeline."
+            echo ""
+            echo "| Detail | Value |"
+            echo "|--------|-------|"
+            echo "| Branch | $BRANCH |"
+            echo "| Commit | $SHORT_SHA |"
+            echo "| Commit Message | $COMMIT_MSG |"
+            echo "| Failed Run | $RUN_URL |"
+            echo "| Severity | $SEVERITY |"
+            echo "| Category | $CATEGORY |"
+            echo "| Auto-fix | $AUTO_FIXABLE |"
+            echo ""
+            echo "---"
+            echo ""
+            echo "## Root Cause Analysis"
+            echo ""
+            echo "$AI_ANALYSIS"
+            echo ""
+            echo "---"
+            echo "Analyzed by GitHub Models (GPT-4o-mini) - Free Tier - Zero cost"
+          } > /tmp/issue_body.txt
 
           LABELS="ai-diagnosis,ci-failure"
           case "$SEVERITY" in
@@ -213,18 +160,15 @@ $AI_ANALYSIS
           esac
 
           gh issue create \
-            --title "🤖 CI Failure: [$CATEGORY] on \`$BRANCH\` — ${COMMIT_SHA:0:7}" \
-            --body "$ISSUE_BODY" \
-            --label "$LABELS" 2>/dev/null || \
+            --title "CI Failure: [$CATEGORY] on $BRANCH - $SHORT_SHA" \
+            --body-file /tmp/issue_body.txt \
+            --label "$LABELS" || \
           gh issue create \
-            --title "🤖 CI Failure: [$CATEGORY] on \`$BRANCH\` — ${COMMIT_SHA:0:7}" \
-            --body "$ISSUE_BODY"
+            --title "CI Failure: [$CATEGORY] on $BRANCH - $SHORT_SHA" \
+            --body-file /tmp/issue_body.txt
 
-          echo "✅ Diagnostic issue created."
+          echo "Diagnostic issue created."
 
-      # ---------------------------------------------------------------
-      # STEP 4: Auto-fix PR for lint errors (full self-healing loop)
-      # ---------------------------------------------------------------
       - name: Auto-fix lint errors
         if: |
           steps.fetch-logs.outputs.has_failures == 'true' &&
@@ -232,73 +176,48 @@ $AI_ANALYSIS
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ steps.fetch-logs.outputs.branch }}
+          COMMIT_SHA: ${{ steps.fetch-logs.outputs.commit_sha }}
         run: |
-          BRANCH="${{ steps.fetch-logs.outputs.branch }}"
-          COMMIT_SHA="${{ steps.fetch-logs.outputs.commit_sha }}"
           FIX_BRANCH="auto-fix/lint-${COMMIT_SHA:0:7}-$(date +%s)"
 
-          echo "🔧 Auto-fixing lint errors on branch: $FIX_BRANCH"
-
-          # Configure git identity for the commit
           git config user.name "Self-Healing CI Bot"
           git config user.email "ci-bot@self-healing.ai"
 
-          # Checkout the exact commit that failed
           git checkout -b "$FIX_BRANCH" "$COMMIT_SHA"
 
-          # Install deps so eslint can run
           npm ci --silent
-
-          # Run eslint --fix
           npx eslint src/ __tests__/ --fix || true
 
-          # Check if there's anything to commit
           if git diff --quiet; then
-            echo "ℹ️ No auto-fixable lint errors found (may need manual fix)."
+            echo "No auto-fixable lint errors found."
             exit 0
           fi
 
-          # Show what was fixed
-          echo "📝 Files changed by eslint --fix:"
-          git diff --name-only
-
           git add -A
-          git commit -m "fix(lint): auto-fix lint errors [self-healing-ci bot]
-
-          This fix was automatically generated by the Self-Healing CI/CD pipeline.
-          Triggered by: CI Pipeline failure on commit ${COMMIT_SHA:0:7}
-          Action: ran \`eslint --fix\` on src/ and __tests__/"
-
+          git commit -m "fix(lint): auto-fix lint errors [self-healing-ci bot]"
           git push origin "$FIX_BRANCH"
 
-          # Open the PR
+          {
+            echo "## Automated Lint Fix"
+            echo ""
+            echo "This PR was automatically generated by the Self-Healing CI/CD pipeline."
+            echo ""
+            echo "**Commit that failed:** ${COMMIT_SHA:0:7}"
+            echo ""
+            echo "**Action taken:** Ran eslint --fix on src/ and __tests__/ directories."
+            echo ""
+            echo "Please review before merging."
+          } > /tmp/pr_body.txt
+
           gh pr create \
-            --title "🤖 Auto-fix: Lint errors on \`$BRANCH\` [${COMMIT_SHA:0:7}]" \
-            --body "## 🔧 Automated Lint Fix
-
-> This PR was **automatically generated** by the Self-Healing CI/CD pipeline.
-
-### What happened
-The CI pipeline failed due to lint errors on commit [\`${COMMIT_SHA:0:7}\`](https://github.com/${{ github.repository }}/commit/$COMMIT_SHA).
-
-### What was done
-Ran \`eslint --fix\` on \`src/\` and \`__tests__/\` directories to automatically resolve fixable lint violations.
-
-### Before merging
-- [ ] Review the changes below
-- [ ] Ensure tests still pass (CI will run automatically on this PR)
-- [ ] Merge if everything looks good
-
----
-<sub>🤖 Generated by Self-Healing CI Bot • GitHub Models (GPT-4o-mini) • Zero cost</sub>" \
+            --title "Auto-fix: Lint errors on $BRANCH [${COMMIT_SHA:0:7}]" \
+            --body-file /tmp/pr_body.txt \
             --base "$BRANCH" \
             --head "$FIX_BRANCH"
 
-          echo "✅ Auto-fix PR opened for lint errors."
+          echo "Auto-fix PR opened for lint errors."
 
-      # ---------------------------------------------------------------
-      # STEP 5: Auto-fix PR for dependency issues
-      # ---------------------------------------------------------------
       - name: Auto-fix dependency issues
         if: |
           steps.fetch-logs.outputs.has_failures == 'true' &&
@@ -306,24 +225,21 @@ Ran \`eslint --fix\` on \`src/\` and \`__tests__/\` directories to automatically
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ steps.fetch-logs.outputs.branch }}
+          COMMIT_SHA: ${{ steps.fetch-logs.outputs.commit_sha }}
         run: |
-          BRANCH="${{ steps.fetch-logs.outputs.branch }}"
-          COMMIT_SHA="${{ steps.fetch-logs.outputs.commit_sha }}"
           FIX_BRANCH="auto-fix/deps-${COMMIT_SHA:0:7}-$(date +%s)"
-
-          echo "🔧 Auto-fixing dependency issues..."
 
           git config user.name "Self-Healing CI Bot"
           git config user.email "ci-bot@self-healing.ai"
 
           git checkout -b "$FIX_BRANCH" "$COMMIT_SHA"
 
-          # Regenerate lockfile
           rm -f package-lock.json
           npm install --silent
 
           if git diff --quiet; then
-            echo "ℹ️ No lockfile changes detected."
+            echo "No lockfile changes detected."
             exit 0
           fi
 
@@ -331,16 +247,20 @@ Ran \`eslint --fix\` on \`src/\` and \`__tests__/\` directories to automatically
           git commit -m "fix(deps): regenerate lockfile [self-healing-ci bot]"
           git push origin "$FIX_BRANCH"
 
+          {
+            echo "## Automated Dependency Fix"
+            echo ""
+            echo "Auto-generated by the Self-Healing CI/CD pipeline."
+            echo ""
+            echo "**Action taken:** Regenerated package-lock.json via npm install."
+            echo ""
+            echo "Please review before merging."
+          } > /tmp/pr_body_deps.txt
+
           gh pr create \
-            --title "🤖 Auto-fix: Dependency issues on \`$BRANCH\` [${COMMIT_SHA:0:7}]" \
-            --body "## 🔧 Automated Dependency Fix
-
-> Auto-generated by the Self-Healing CI/CD pipeline.
-
-**Action taken**: Regenerated \`package-lock.json\` via \`npm install\`.
-
-> ⚠️ Please review before merging." \
+            --title "Auto-fix: Dependency issues on $BRANCH [${COMMIT_SHA:0:7}]" \
+            --body-file /tmp/pr_body_deps.txt \
             --base "$BRANCH" \
             --head "$FIX_BRANCH"
 
-          echo "✅ Auto-fix PR opened for dependency issues."
+          echo "Auto-fix PR opened for dependency issues."
